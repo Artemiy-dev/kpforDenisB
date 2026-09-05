@@ -631,10 +631,10 @@
 
             <fieldset>
                 <legend>Вступительный абзац</legend>
-                <div class="field"><label for="introTextInput">Свой текст вместо «Компания … является Партнером ...»</label>
+                <div class="field"><label for="introTextInput">Текст ПОСЛЕ запятой («Партнером HP, …»)</label>
                     <textarea id="introTextInput" rows="3" placeholder="оставьте пустым — абзац останется как в файле"></textarea></div>
-                <p class="hint">Впишите сюда полностью новый текст выделенного вступительного абзаца — старый текст будет скрыт под белой плашкой, а ваш впечатается на его место (можно длиннее или короче исходного, перенос строк — автоматический, лишние строки старого
-                    текста снизу тоже будут скрыты).</p>
+                <p class="hint">Часть фразы ДО первой запятой («Компания … является Партнером HP,») остаётся как в файле — её трогать не нужно. А сюда впишите то, что должно идти после запятой (например, название компании-получателя и её БИН) — старый текст после запятой
+                    будет скрыт под белой плашкой, а ваш впечатается на его место. Если не помещается в строку — само перенесётся под низ, на всю ширину абзаца.</p>
                 <div class="field"><label for="introFontSizeInput">Размер шрифта</label>
                     <select id="introFontSizeInput">
                         <option value="auto">Авто (как в шаблоне)</option>
@@ -1379,13 +1379,37 @@
                 return rows;
             }
 
-            // The intro paragraph reads "Компания <Название> является Партнером ...", possibly
-            // wrapping onto several lines, and is often followed (after a blank-line paragraph
-            // break) by a lead-in sentence like "Мы рады предложить Вам рассмотреть следующее
-            // оборудование:" that visually belongs to the same greeting block. The user wants to
-            // be able to rewrite the WHOLE thing by hand, so this finds the row containing the
-            // "Компания" label and keeps pulling in following rows as long as the vertical gap
-            // stays within one skipped blank line's worth of space (capped at 10 lines total).
+            // Looks for the first comma in a row, at or after x = afterX, and returns the PDF-point
+            // x position right after it. pdf.js usually keeps a whole run like "Партнером HP," as
+            // one text item, so this mostly just returns that item's right edge; if a comma sits
+            // mid-item it interpolates proportionally by character count (there's no per-glyph
+            // width from pdf.js, so this is an approximation, close enough for a cover box).
+            function findIntroSplitX(row, afterX) {
+                for (var i = 0; i < row.items.length; i++) {
+                    var it = row.items[i];
+                    var right = it.transform[4] + (it.width || 0);
+                    if (right < afterX - 1) continue;
+                    var str = it.str || "";
+                    var commaIdx = str.indexOf(",");
+                    if (commaIdx !== -1) {
+                        var frac = str.length > 0 ? (commaIdx + 1) / str.length : 1;
+                        return it.transform[4] + (it.width || 0) * frac;
+                    }
+                }
+                return null;
+            }
+
+            // The intro paragraph reads "Компания <Название> является Партнером HP, выражает ...",
+            // possibly wrapping onto several lines, and is often followed (after a blank-line
+            // paragraph break) by a lead-in sentence like "Мы рады предложить Вам рассмотреть
+            // следующее оборудование:" that visually belongs to the same greeting block. This finds
+            // the row containing the "Компания" label and keeps pulling in following rows as long
+            // as the vertical gap stays within one skipped blank line's worth of space (capped at
+            // 10 lines total). It also looks for the first comma on the label's row: everything up
+            // to and including that comma (e.g. "Компания X является Партнером HP,") is the fixed
+            // sender boilerplate and is left untouched; only the text from right after the comma
+            // onward is covered and replaceable, so the customer can type just the recipient's
+            // name/BIN there while the opening clause keeps printing automatically.
             function markIntroBlock(items, labelItem) {
                 if (!labelItem) return null;
                 var rows = buildRows(items);
@@ -1414,7 +1438,6 @@
                     return r.maxX;
                 }));
                 var topRow = included[0];
-                var px = pdfPointToPixel(leftX, topRow.y);
                 var fontSizePx = topRow.fontSize * tpl.viewport.scale;
                 var wrapWidthPt = Math.max(80, rightX - leftX);
                 // Safety cap: never let the wrap column exceed a sane share of the page width.
@@ -1425,41 +1448,61 @@
                     var maxReasonableWidthPt = (tpl.viewport.width / tpl.viewport.scale) * 0.8;
                     wrapWidthPt = Math.min(wrapWidthPt, maxReasonableWidthPt);
                 }
+
+                var labelEndX = labelItem.transform[4] + (labelItem.width || 0);
+                var splitX = findIntroSplitX(topRow, labelEndX);
+                var firstX = splitX != null ? splitX : leftX;
+                var firstLineWrapWidthPt = Math.max(40, Math.min(rightX - firstX, wrapWidthPt));
+
+                var pxFirst = pdfPointToPixel(firstX, topRow.y);
+                var pxLeft = pdfPointToPixel(leftX, topRow.y);
                 return {
-                    px: px.x,
-                    py: px.y,
+                    px: pxFirst.x,
+                    py: pxFirst.y,
+                    leftPx: pxLeft.x,
                     fontSizePx: fontSizePx,
                     wrapWidthPt: wrapWidthPt,
+                    firstLineWrapWidthPt: firstLineWrapWidthPt,
+                    hasSplit: splitX != null,
                     sourceLines: included.length,
                     detected: true
                 };
             }
 
-            // Shared word-wrap: splits on explicit newlines first, then greedily wraps words
-            // per line using whatever measurement function the caller provides (canvas
-            // measureText for the preview, pdf-lib's widthOfTextAtSize for the export).
-            function wrapTextGeneric(text, maxWidth, measureFn) {
+            // Shared word-wrap: splits on explicit newlines first, then greedily wraps words per
+            // line. The first line may have a different available width than the rest (e.g. it
+            // starts right after a comma mid-sentence, while continuation lines drop back to the
+            // paragraph's left margin), using whatever measurement function the caller provides
+            // (canvas measureText for the preview, pdf-lib's widthOfTextAtSize for the export).
+            function wrapTextTwoWidth(text, firstWidth, restWidth, measureFn) {
                 var paragraphs = String(text || "").split(/\r?\n/);
                 var lines = [];
+                var isFirstLine = true;
                 paragraphs.forEach(function(para) {
                     var words = para.split(/\s+/).filter(function(w) {
                         return w.length > 0;
                     });
                     if (!words.length) {
                         lines.push("");
+                        isFirstLine = false;
                         return;
                     }
                     var current = "";
                     words.forEach(function(word) {
+                        var maxWidth = isFirstLine ? firstWidth : restWidth;
                         var candidate = current ? current + " " + word : word;
                         if (current && maxWidth > 0 && measureFn(candidate) > maxWidth) {
                             lines.push(current);
+                            isFirstLine = false;
                             current = word;
                         } else {
                             current = candidate;
                         }
                     });
-                    if (current) lines.push(current);
+                    if (current) {
+                        lines.push(current);
+                        isFirstLine = false;
+                    }
                 });
                 while (lines.length && lines[0] === "") lines.shift();
                 while (lines.length && lines[lines.length - 1] === "") lines.pop();
@@ -1603,8 +1646,10 @@
                 ctx.save();
                 ctx.textBaseline = "alphabetic";
                 ctx.font = style.weight + " " + fs.toFixed(1) + "px 'PT Sans', sans-serif";
-                var maxWidthPx = tpl.kind === "pdf" ? mark.wrapWidthPt * tpl.viewport.scale : (mark.wrapWidthPt || 380);
-                var lines = wrapTextGeneric(text, maxWidthPx, function(s) {
+                var leftPx = (mark.leftPx != null) ? mark.leftPx : mark.px;
+                var firstWidthPx = tpl.kind === "pdf" ? (mark.firstLineWrapWidthPt || mark.wrapWidthPt) * tpl.viewport.scale : (mark.wrapWidthPt || 380);
+                var restWidthPx = tpl.kind === "pdf" ? mark.wrapWidthPt * tpl.viewport.scale : (mark.wrapWidthPt || 380);
+                var lines = wrapTextTwoWidth(text, firstWidthPx, restWidthPx, function(s) {
                     return ctx.measureText(s).width;
                 });
                 if (!lines.length) {
@@ -1612,26 +1657,31 @@
                     return;
                 }
                 var lineHeightPx = fs * 1.35;
-                var maxLineWidth = 0;
-                lines.forEach(function(l) {
-                    maxLineWidth = Math.max(maxLineWidth, ctx.measureText(l).width);
-                });
-                var coverWidth = Math.max(maxWidthPx, maxLineWidth) + 16;
                 // Cover at least as many lines as the ORIGINAL detected paragraph had, even if
                 // the newly typed text is shorter — otherwise leftover original lines below
                 // (e.g. a trailing "Мы рады предложить..." sentence) would stay visible.
                 var neededLines = Math.max(lines.length, mark.sourceLines || 1);
-                var topY = mark.py - fs * 1.2;
-                var bottomY = mark.py + (neededLines - 1) * lineHeightPx + fs * 0.4;
+                // Cover box drawn PER LINE (not one big rectangle): the first line starts right
+                // after the detected comma, so anything to its left — the fixed "Компания X
+                // является Партнером HP," boilerplate — must stay uncovered and visible.
                 ctx.fillStyle = "#FFFFFF";
-                ctx.fillRect(mark.px - 6, topY, coverWidth, bottomY - topY);
+                for (var i = 0; i < neededLines; i++) {
+                    var lineX = i === 0 ? mark.px : leftPx;
+                    var lineY = mark.py + i * lineHeightPx;
+                    var lineWidthPx = i === 0 ? firstWidthPx : restWidthPx;
+                    var lineText = lines[i] || "";
+                    var measured = lineText ? ctx.measureText(lineText).width : 0;
+                    var coverW = Math.max(lineWidthPx, measured) + 16;
+                    ctx.fillRect(lineX - 6, lineY - fs * 1.2, coverW, fs * 1.55);
+                }
                 ctx.beginPath();
                 ctx.arc(mark.px - 8, mark.py - fs * 0.32, 3.5, 0, Math.PI * 2);
                 ctx.fillStyle = "#8C6A22";
                 ctx.fill();
                 ctx.fillStyle = style.color;
                 lines.forEach(function(l, idx) {
-                    ctx.fillText(l, mark.px, mark.py + idx * lineHeightPx);
+                    var lineX = idx === 0 ? mark.px : leftPx;
+                    ctx.fillText(l, lineX, mark.py + idx * lineHeightPx);
                 });
                 ctx.restore();
             }
@@ -1672,8 +1722,11 @@
                     marks.intro = {
                         px: p.x,
                         py: p.y,
+                        leftPx: existing ? existing.leftPx : p.x,
                         fontSizePx: existing ? existing.fontSizePx : defaultFs,
                         wrapWidthPt: existing ? existing.wrapWidthPt : defaultWrapWidthPt,
+                        firstLineWrapWidthPt: existing ? existing.firstLineWrapWidthPt : defaultWrapWidthPt,
+                        hasSplit: existing ? existing.hasSplit : false,
                         sourceLines: existing ? existing.sourceLines : 1,
                         detected: false
                     };
@@ -1967,45 +2020,55 @@
                     var introFont = style.weight === "700" ? boldFont : regularFont;
                     var introColor = PDFLib.rgb(style.rgb[0], style.rgb[1], style.rgb[2]);
                     var overridePt = introFontSizeInput.value !== "auto" ? parseFloat(introFontSizeInput.value) : null;
-                    var xPdf, yPdf, sizePt, wrapWidthPt;
+                    var xPdfFirst, xPdfLeft, yPdf, sizePt, firstWidthPt, restWidthPt;
+                    var leftPxVal = (mark.leftPx != null) ? mark.leftPx : mark.px;
                     if (tpl.kind === "pdf") {
                         var pt = tpl.viewport.convertToPdfPoint(mark.px, mark.py);
-                        xPdf = pt[0];
+                        xPdfFirst = pt[0];
                         yPdf = pt[1];
+                        xPdfLeft = tpl.viewport.convertToPdfPoint(leftPxVal, mark.py)[0];
                         sizePt = overridePt || Math.max(8, mark.fontSizePx / tpl.viewport.scale);
-                        wrapWidthPt = mark.wrapWidthPt;
+                        firstWidthPt = mark.firstLineWrapWidthPt || mark.wrapWidthPt;
+                        restWidthPt = mark.wrapWidthPt;
                     } else {
                         var scale = tpl.naturalWidth / (tpl.pxWidth || tpl.naturalWidth);
-                        xPdf = mark.px * scale;
+                        xPdfFirst = mark.px * scale;
+                        xPdfLeft = leftPxVal * scale;
                         yPdf = tpl.naturalHeight - (mark.py * scale);
                         sizePt = overridePt || Math.max(8, mark.fontSizePx * scale);
-                        wrapWidthPt = mark.wrapWidthPt || 380;
+                        firstWidthPt = mark.firstLineWrapWidthPt || mark.wrapWidthPt || 380;
+                        restWidthPt = mark.wrapWidthPt || 380;
                     }
-                    var lines = wrapTextGeneric(text, wrapWidthPt, function(s) {
+                    var lines = wrapTextTwoWidth(text, firstWidthPt, restWidthPt, function(s) {
                         return introFont.widthOfTextAtSize(s, sizePt);
                     });
                     if (!lines.length) return;
                     var lineHeightPt = sizePt * 1.35;
-                    var maxLineWidth = 0;
-                    lines.forEach(function(l) {
-                        maxLineWidth = Math.max(maxLineWidth, introFont.widthOfTextAtSize(l, sizePt));
-                    });
-                    var coverWidth = Math.max(wrapWidthPt, maxLineWidth) + 14;
                     // Cover at least as many lines as the ORIGINAL detected paragraph had, even
                     // if the newly typed text is shorter — see drawIntroMark for why.
                     var neededLines = Math.max(lines.length, mark.sourceLines || 1);
-                    var topY = yPdf + sizePt * 1.25;
-                    var bottomY = (yPdf - (neededLines - 1) * lineHeightPt) - sizePt * 0.4;
-                    page.drawRectangle({
-                        x: xPdf - 5,
-                        y: bottomY,
-                        width: coverWidth,
-                        height: topY - bottomY,
-                        color: white
-                    });
+                    // One rectangle PER LINE, not a single box: the first line starts right after
+                    // the detected comma, so the fixed "Компания X является Партнером HP," text
+                    // to its left must stay uncovered and visible in the exported PDF too.
+                    for (var i = 0; i < neededLines; i++) {
+                        var lineXPdf = i === 0 ? xPdfFirst : xPdfLeft;
+                        var lineYPdf = yPdf - i * lineHeightPt;
+                        var lineMaxWidthPt = i === 0 ? firstWidthPt : restWidthPt;
+                        var lineText = lines[i] || "";
+                        var measuredPt = lineText ? introFont.widthOfTextAtSize(lineText, sizePt) : 0;
+                        var coverW = Math.max(lineMaxWidthPt, measuredPt) + 14;
+                        page.drawRectangle({
+                            x: lineXPdf - 5,
+                            y: lineYPdf - sizePt * 0.35,
+                            width: coverW,
+                            height: sizePt * 1.6,
+                            color: white
+                        });
+                    }
                     lines.forEach(function(l, idx) {
+                        var lineXPdf = idx === 0 ? xPdfFirst : xPdfLeft;
                         page.drawText(l, {
-                            x: xPdf,
+                            x: lineXPdf,
                             y: yPdf - idx * lineHeightPt,
                             size: sizePt,
                             font: introFont,
