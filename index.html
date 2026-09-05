@@ -631,10 +631,10 @@
 
             <fieldset>
                 <legend>Вступительный абзац</legend>
-                <div class="field"><label for="introTextInput">Текст ПОСЛЕ запятой («Партнером HP, …»)</label>
-                    <textarea id="introTextInput" rows="3" placeholder="оставьте пустым — абзац останется как в файле"></textarea></div>
-                <p class="hint">Часть фразы ДО последней запятой в приветствии («Компания … является Партнером HP,») остаётся как в файле — её трогать не нужно. А сюда впишите то, что должно идти после этой запятой (например, название компании-получателя и её БИН) —
-                    старый текст после запятой будет скрыт под белой плашкой, а ваш впечатается на его место. Если не помещается в строку — само перенесётся под низ, на всю ширину абзаца.</p>
+                <div class="field"><label for="introTextInput">Текст ПОСЛЕ приветствия (например, БИН)</label>
+                    <textarea id="introTextInput" rows="3" placeholder="оставьте пустым — ничего не добавится"></textarea></div>
+                <p class="hint">Весь абзац приветствия («Компания … является Партнером HP, выражает … с Вашей Организацией.») остаётся как в файле — его трогать не нужно. А сюда впишите то, что должно быть добавлено СРАЗУ ПОСЛЕ него (например «БИН: 123456789012») — текст
+                    встанет сразу за абзацем, в обычно пустом месте перед следующим блоком. Если не помещается в строку — само перенесётся под низ, на всю ширину абзаца.</p>
                 <div class="field"><label for="introFontSizeInput">Размер шрифта</label>
                     <select id="introFontSizeInput">
                         <option value="auto">Авто (как в шаблоне)</option>
@@ -1379,53 +1379,18 @@
                 return rows;
             }
 
-            // Scans every item, across ALL given rows in reading order, for the LAST comma
-            // anywhere — so if the greeting spans several lines and/or has more than one comma
-            // (e.g. "Компания X, официальный партнер HP, выражает..."), the split lands after the
-            // very last one, wherever it falls, not the first. Whenever an item's trimmed text
-            // ends right on a comma (the common case — pdf.js usually keeps a run like "Партнером
-            // HP," as one whole item) that item's own right edge is used directly, so the glyph
-            // is never sliced into by a rounding error. Only when a comma sits mid-item (rare) does
-            // it fall back to interpolating a position proportionally by character count.
-            function findLastCommaSplit(rows) {
-                var result = null; // { rowIndex, x }
-                rows.forEach(function(row, rowIndex) {
-                    row.items.forEach(function(it) {
-                        var str = it.str || "";
-                        var trimmedEnd = str.replace(/\s+$/, "");
-                        if (trimmedEnd.length > 0 && trimmedEnd.charAt(trimmedEnd.length - 1) === ",") {
-                            result = {
-                                rowIndex: rowIndex,
-                                x: it.transform[4] + (it.width || 0)
-                            };
-                            return;
-                        }
-                        var commaIdx = str.lastIndexOf(",");
-                        if (commaIdx !== -1) {
-                            var frac = str.length > 0 ? (commaIdx + 1) / str.length : 1;
-                            result = {
-                                rowIndex: rowIndex,
-                                x: it.transform[4] + (it.width || 0) * frac
-                            };
-                        }
-                    });
-                });
-                return result;
-            }
-
-            // The intro paragraph reads "Компания <Название> является Партнером HP, выражает ...",
-            // possibly wrapping onto several lines, and is often followed (after a blank-line
-            // paragraph break) by a lead-in sentence like "Мы рады предложить Вам рассмотреть
-            // следующее оборудование:" that visually belongs to the same greeting block. This finds
-            // the row containing the "Компания" label and keeps pulling in following rows as long
-            // as the vertical gap stays within one skipped blank line's worth of space (capped at
-            // 10 lines total). It then looks for the LAST comma anywhere in that whole block
-            // (which may land on a later row than the label, if the opening clause runs long):
-            // everything up to and including that final comma (e.g. "Компания X является
-            // Партнером HP,") is the fixed sender boilerplate and stays completely untouched —
-            // whole rows before it aren't covered at all — while only the text from right after it
-            // onward is covered and replaceable, so the customer can type just the recipient's
-            // name/BIN there while the opening clause keeps printing automatically.
+            // The intro paragraph reads "Компания <Название> является Партнером HP, выражает Вам
+            // свое почтение и заинтересованность в сотрудничестве с Вашей Организацией.", often
+            // wrapping onto 2-3 lines. This finds the row containing the "Компания" label and
+            // keeps pulling in following rows as long as they're still part of the SAME paragraph
+            // (a small vertical gap, i.e. a normal line wrap) — a blank-line gap to the NEXT
+            // paragraph (e.g. "Мы рады предложить Вам рассмотреть следующее оборудование:") stops
+            // it there, since that next paragraph is a separate sentence and is left alone.
+            // The whole detected paragraph stays exactly as in the file — nothing in it is
+            // covered or replaced. The customer's own text (e.g. a BIN) is appended right after
+            // the END of the paragraph's last line: it continues on that same line if there's
+            // room, and wraps onto new lines below (using the paragraph's own left margin, in
+            // what is normally blank space before the next paragraph) if not.
             function markIntroBlock(items, labelItem) {
                 if (!labelItem) return null;
                 var rows = buildRows(items);
@@ -1439,11 +1404,10 @@
                 if (startIdx === -1) return null;
 
                 var lineHeightGuess = rows[startIdx].fontSize * 1.6;
-                var paragraphGapLimit = lineHeightGuess * 2.4; // allow swallowing one blank-line break between paragraphs
                 var included = [rows[startIdx]];
-                for (var k = startIdx + 1; k < rows.length && included.length < 10; k++) {
+                for (var k = startIdx + 1; k < rows.length && included.length < 6; k++) {
                     var gap = included[included.length - 1].y - rows[k].y;
-                    if (gap > paragraphGapLimit) break;
+                    if (gap > lineHeightGuess) break; // a bigger gap means a new paragraph — stop here
                     included.push(rows[k]);
                 }
 
@@ -1463,18 +1427,13 @@
                     wrapWidthPt = Math.min(wrapWidthPt, maxReasonableWidthPt);
                 }
 
-                var commaSplit = findLastCommaSplit(included);
-                var splitRowIdx = commaSplit ? commaSplit.rowIndex : 0;
-                var splitRow = included[splitRowIdx];
-                var firstX = commaSplit ? commaSplit.x : leftX;
+                var lastRow = included[included.length - 1];
+                var firstX = lastRow.maxX;
                 var firstLineWrapWidthPt = Math.max(40, Math.min(rightX - firstX, wrapWidthPt));
-                var fontSizePx = splitRow.fontSize * tpl.viewport.scale;
+                var fontSizePx = lastRow.fontSize * tpl.viewport.scale;
 
-                var pxFirst = pdfPointToPixel(firstX, splitRow.y);
-                var pxLeft = pdfPointToPixel(leftX, splitRow.y);
-                // Rows strictly before the split row are entirely untouched (not covered at all),
-                // so only the rows from the split row onward count toward how many lines the
-                // cover needs to hide.
+                var pxFirst = pdfPointToPixel(firstX, lastRow.y);
+                var pxLeft = pdfPointToPixel(leftX, lastRow.y);
                 return {
                     px: pxFirst.x,
                     py: pxFirst.y,
@@ -1482,8 +1441,8 @@
                     fontSizePx: fontSizePx,
                     wrapWidthPt: wrapWidthPt,
                     firstLineWrapWidthPt: firstLineWrapWidthPt,
-                    hasSplit: commaSplit != null,
-                    sourceLines: included.length - splitRowIdx,
+                    hasSplit: true, // appended right after existing text — keep the tight cover inset
+                    sourceLines: 1, // nothing existing to hide: this space is normally blank
                     detected: true
                 };
             }
@@ -1707,15 +1666,16 @@
                     return;
                 }
                 var lineHeightPx = fs * 1.35;
-                // Cover at least as many lines as the ORIGINAL detected paragraph had, even if
-                // the newly typed text is shorter — otherwise leftover original lines below
-                // (e.g. a trailing "Мы рады предложить..." sentence) would stay visible.
+                // mark.sourceLines is 1 here: text is appended right after the paragraph into
+                // normally-blank space, so there's nothing existing to hide beyond the typed
+                // lines themselves.
                 var neededLines = Math.max(lines.length, mark.sourceLines || 1);
                 // Cover box drawn PER LINE (not one big rectangle): the first line starts right
-                // after the detected comma, so anything to its left — the fixed "Компания X
-                // является Партнером HP," boilerplate — must stay uncovered and visible. That
-                // line therefore gets almost no backward padding (unlike the other marks' usual
-                // 6px buffer), so the box doesn't reach back and paint over the comma itself.
+                // after the end of the paragraph's last line, so anything to its left — the fixed
+                // "Компания X является Партнером HP, ... с Вашей Организацией." boilerplate —
+                // must stay uncovered and visible. That line therefore gets almost no backward
+                // padding (unlike the other marks' usual 6px buffer), so the box doesn't reach
+                // back and paint over the paragraph's own trailing punctuation.
                 ctx.fillStyle = "#FFFFFF";
                 for (var i = 0; i < neededLines; i++) {
                     var lineX = i === 0 ? mark.px : leftPx;
@@ -2102,14 +2062,15 @@
                     });
                     if (!lines.length) return;
                     var lineHeightPt = sizePt * 1.35;
-                    // Cover at least as many lines as the ORIGINAL detected paragraph had, even
-                    // if the newly typed text is shorter — see drawIntroMark for why.
+                    // sourceLines is 1: this text is appended into normally-blank space right
+                    // after the paragraph, so there's nothing existing to hide — see drawIntroMark.
                     var neededLines = Math.max(lines.length, mark.sourceLines || 1);
                     // One rectangle PER LINE, not a single box: the first line starts right after
-                    // the detected comma, so the fixed "Компания X является Партнером HP," text
-                    // to its left must stay uncovered and visible in the exported PDF too — so
-                    // that line gets almost no backward padding (unlike the usual 5pt buffer),
-                    // or the box would reach back and paint over the comma itself.
+                    // the end of the paragraph's last line, so the fixed "Компания X является
+                    // Партнером HP, ... с Вашей Организацией." text to its left must stay
+                    // uncovered and visible in the exported PDF too — so that line gets almost no
+                    // backward padding (unlike the usual 5pt buffer), or the box would reach back
+                    // and paint over the paragraph's own trailing punctuation.
                     for (var i = 0; i < neededLines; i++) {
                         var lineXPdf = i === 0 ? xPdfFirst : xPdfLeft;
                         var leftInsetPt = (i === 0 && mark.hasSplit) ? 1 : 5;
